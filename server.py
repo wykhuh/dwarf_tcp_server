@@ -1,14 +1,19 @@
 import socket
 import threading
+import time
+import importlib
+import pytz
+
 from queue import Queue
 
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import config
 import lib.my_logger as my_logger
-from lib.stellarium_utils import process_stellarium_data, update_stellarium
 from lib.dwarf_utils import perform_goto
+from lib.ftp_utils import test_ssh_connection, download_file_via_ssh, extract_last_matching_line, extract_desired_value, update_config_file
+from lib.stellarium_utils import process_stellarium_data, update_stellarium
+
 
 # Convert Deg to 
 def process_deg_dec(deg_dec):
@@ -44,9 +49,58 @@ dwarf_goto_thread_started = False
 dwarf_goto_thread = False
 
 nbDeconnect = 10
+ssh_host = config.DWARF_IP
+ssh_port = 22
+ssh_username = "root"
+ssh_password = "rockchip"
+remote_file_path = "/userdata/log/dwarf/dwarf.log"
+local_file_path = "dwarf.log"
+search_string = "master client id ="
+config_file_path = "config.py"
 
-while True:
+processAction = True
 
+try:
+    my_logger.info(f"Try to connect to DWARF, with IP : {ssh_host}")
+    my_logger.info("To Stop the program, Use CTRL+C")
+    time.sleep(1)
+    while True:
+        # Test SSH connection
+        if test_ssh_connection(ssh_host, ssh_port, ssh_username, ssh_password):
+            my_logger.info("connection successful to DWARF ")
+            
+            # Download the file from the SSH server
+            download_file_via_ssh(ssh_host, ssh_port, ssh_username, ssh_password, remote_file_path, local_file_path)
+
+            # Extract the last line containing the search string
+            last_matching_line = extract_last_matching_line(local_file_path, search_string)
+
+            # Extract the desired value after the search string
+            if last_matching_line:
+                new_client_id = extract_desired_value(last_matching_line, search_string)
+                my_logger.info(f"Extracted new CLIENT_ID: {new_client_id}")
+                
+                # Update the config file with the new client_id
+                update_config_file(config_file_path, new_client_id)
+                
+                # Reload the config module to reflect the updated CLIENT_ID
+                importlib.reload(config)
+                my_logger.info(f"Updated CLIENT_ID to match DwarfLab app one")
+                break  # Exit the loop since we found the client_id
+            else:
+                my_logger.info("No line containing the search string was found. Retrying...")
+        else:
+            my_logger.info("DWARF connection failed. Retrying...")
+
+        # Wait for a short period before retrying (e.g., 10 seconds)
+        time.sleep(10)
+
+except KeyboardInterrupt:
+    my_logger.info("Process interrupted by user. Exiting...")
+    processAction = False
+
+while processAction:
+  try:
     my_logger.info(f"Waiting Connection to Stellarium : {config.HOST}")
 
     # create socket
@@ -57,20 +111,46 @@ while True:
     sock.bind((config.HOST, config.PORT))
     # set number of client that can be queued
     sock.listen(5)
+    sock.settimeout(30)  # Set a timeout of 30 seconds
 
     while True:
-        # create new socket to interact with client
-        new_socket, addr = sock.accept()
-        my_logger.info(f"Connected by {addr}")
-
-        raw_data = new_socket.recv(1024)
-        if not raw_data:
+        try:
+            # create new socket to interact with client
+            new_socket = None
+            addr = None
+            new_socket, addr = sock.accept()
+            my_logger.info(f"Connected by {addr}")
+   
+            raw_data = new_socket.recv(1024)
+            if not raw_data:
+                break
+                # Process raw_data here...
+        except TimeoutError:
+            my_logger.info("No incoming connections. Timeout reached, retrying...")
+            sock.close()
+            if new_socket:
+                new_socket.close()
             break
+        except ConnectionResetError:
+            my_logger.info("Error Connection stops. Closing connection...")
+            sock.close()
+            if new_socket:
+                new_socket.close()
+            break
+        except KeyboardInterrupt:
+            my_logger.info("Process interrupted by user. Closing connection...")
+            sock.close()
+            if new_socket:
+                new_socket.close()
+            break
+
+        # Process raw_data here...
 
         # process data from Stellarium PC to get RA/Dec
         data = process_stellarium_data(raw_data)
 
         if (data): # For Stellarium PC
+            my_logger.info("Connected to Stellarium PC")
             # send goto command to DWARF II
             if hasattr(config, 'VERSION_API'):
                 if (config.VERSION_API == 1):
@@ -87,12 +167,14 @@ while True:
             new_socket.close()
 
         else: # For Stellarium Mobile Plus simulate Telescope Nexstar
+            my_logger.info("Connected to Stellarium Mobile +")
             location = ""
             datetoday = ""
             goto_data = b'1B4A735F,3F7A6B85#' # Init to Polaris Position
             goto = False
             ra_deg = 0
             dec_deg = 0
+            DST = None
 
             while True:
                 send_data = b'##'
@@ -127,9 +209,10 @@ while True:
                         local_timezone = "UTC"
                         my_logger.debug(f"No TimeZone defined in config, UTC used")
 
-                    # Show Local Timezone
-                    my_logger.debug(f"Local Timezone:", local_timezone)
-                    date_GMTDST = datetime(today.year, today.month, today.day, tzinfo=ZoneInfo(local_timezone))
+                    # adding a timezone
+                    timezone = pytz.timezone(local_timezone)
+                    date_GMTDST = timezone.localize(today)
+
                     # Get GMT
                     gmt = int(date_GMTDST.utcoffset().total_seconds() // 3600)
                     if (gmt < 0):
@@ -138,6 +221,9 @@ while True:
                     dst_active = 1
                     if (int(date_GMTDST.dst().total_seconds()) == 0):
                         dst_active = 0
+                    # dst_active seems different, so get the one received
+                    if DST is not None:
+                        dst_active = int(not DST == "")
                     my_logger.debug(f"Local Date Time :", today, gmt, dst_active)
 
                     # today_hexa = f"{hex(today.hour)[2:]}{hex(today.minute)[2:]}{hex(today.second)[2:]}{hex(today.month)[2:]}{hex(today.day)[2:]}{hex(today.year-2000)[2:]}{hex(gmt)[2:]}{hex(dst_active)[2:]}"
@@ -252,12 +338,25 @@ while True:
 
                     send_data = b'#'  
 
-                my_logger.debug(f"Sending ...", send_data)
-                new_socket.send(send_data)
+                new_socket.settimeout(10)  # Set a timeout of 10 seconds
+                try:
+                    my_logger.debug(f"Sending ...", send_data)
+                    new_socket.send(send_data)
 
-                raw_data = new_socket.recv(1024)
-                if not raw_data:
-                   break
+                    raw_data = new_socket.recv(1024)
+                    if not raw_data:
+                        break
+                        # Process raw_data here...
+                except socket.timeout:
+                    my_logger.info("Send operation timed out.")
+                except ConnectionResetError:
+                    my_logger.info("Error Connection stops. Closing connection...")
+                    new_socket.close()
+                    break
+                except KeyboardInterrupt:
+                    my_logger.info("Process interrupted by user. Closing connection...")
+                    new_socket.close()
+                    break
 
                 my_logger.debug("data from Stellarium >>", raw_data)
 
@@ -276,7 +375,10 @@ while True:
                         # Create a thread and pass variables to it for next time
                         dwarf_goto_thread = False
 
-    my_logger.debug(f"Disconnected from Stellarium : {addr}")
+    if addr:
+        my_logger.debug(f"Disconnected from Stellarium : {addr}")
+    else:
+        my_logger.debug(f"Not connected to Stellarium")
 
     nbDeconnect -= 1
 
@@ -288,3 +390,11 @@ while True:
             break;
         else:
             nbDeconnect = 3
+
+  except KeyboardInterrupt:
+    my_logger.info("Process interrupted by user. Exiting...")
+    processAction = False
+  finally:
+    if sock:
+        sock.close()
+        my_logger.info("Socket closed.")

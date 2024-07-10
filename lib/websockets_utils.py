@@ -607,7 +607,12 @@ class WebSocketClient:
                 print("WebSocket Terminated.")
 
 # Run the client
-def start_socket(message, command, type_id, module_id, uri=config.DWARF_IP, client_id=config.CLIENT_ID, ping_interval_task=10):
+def start_socket(message, command, type_id, module_id, uri=None, client_id=None, ping_interval_task=10):
+    if uri is None:
+        uri = config.DWARF_IP
+    if client_id is None:
+        client_id = config.CLIENT_ID
+
     websocket_uri = ws_uri(uri)
 
     print(f"Try Connect to {websocket_uri} for {client_id} with data:")
